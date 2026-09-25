@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"pgregory.net/rapid"
 )
@@ -77,6 +78,56 @@ func TestRemove(t *testing.T) {
 		}
 		if out != join(want) {
 			t.Fatalf("remove %q from %q gave %q", k, text, out)
+		}
+	})
+}
+
+func TestDateLineParsesBack(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		// From the year 1 to the year 9999: RFC 3339 has four digits for
+		// the year.
+		u := time.Unix(rapid.Int64Range(-62135596800, 253402300799).Draw(t, "unix"), rapid.Int64Range(0, 999999999).Draw(t, "ns"))
+		got, ok := dateOf(dateLine(u))
+		if !ok || !got.Equal(u.Truncate(time.Second)) {
+			t.Fatalf("%q gave %v %v", dateLine(u), got, ok)
+		}
+	})
+}
+
+func TestParseDates(t *testing.T) {
+	d := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	e := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	ls := parse("a.com\tA\t\n# 2026-01-02T03:04:05Z\nb.com\tB\t\n# a comment\nc.com\tC\t\n#2026-01-01T00:00:00Z\nd.com\tD\t\n")
+	want := []time.Time{{}, d, d, e}
+	if len(ls) != len(want) {
+		t.Fatalf("got %d links", len(ls))
+	}
+	for i, l := range ls {
+		if !l.Added.Equal(want[i]) {
+			t.Errorf("%s: added %v, want %v", l.URL, l.Added, want[i])
+		}
+	}
+}
+
+func TestAddDatedDatesOnlyTheNewLinks(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		base, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "base"))
+		rows := rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "rows")
+		when := time.Unix(rapid.Int64Range(0, 4102444800).Draw(t, "when"), 0)
+		out, added, _ := addDated(base, rows, when)
+		old, ls := parse(base), parse(out)
+		switch {
+		case added == 0 && out != base:
+			t.Fatalf("no link added, but the text changed to %q", out)
+		case added > 0 && !strings.HasPrefix(out, base+dateLine(when)+"\n"):
+			t.Fatalf("no date line after the old links in %q", out)
+		case len(ls) != len(old)+added:
+			t.Fatalf("%d links, want %d + %d", len(ls), len(old), added)
+		}
+		for i, l := range ls {
+			if i < len(old) && !l.Added.Equal(old[i].Added) || i >= len(old) && !l.Added.Equal(when) {
+				t.Fatalf("link %d %q has the time %v", i, l.URL, l.Added)
+			}
 		}
 	})
 }

@@ -1,12 +1,12 @@
 // sbm-webpublish publishes an sbm bookmark file as a list of links on a
-// web site. The site gets the links as JSON from /links/links.json. The
-// owner adds, deletes and imports links on /links/admin.
+// web site. Everyone can get the links as sbm lines, as an Atom feed and as
+// HTML (see public.go). The owner adds, deletes and imports links on
+// /links/admin.
 package main
 
 import (
 	"crypto/subtle"
 	_ "embed"
-	"encoding/json"
 	"errors"
 	"html/template"
 	"io"
@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 )
 
 //go:embed admin.html
@@ -34,30 +35,47 @@ type store struct {
 	path string
 }
 
-func (s *store) read() (string, error) {
-	b, err := os.ReadFile(s.path)
+// read gives the text of the file and the time of its last change. A
+// missing file is an empty file.
+func (s *store) read() (string, time.Time, error) {
+	f, err := os.Open(s.path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", nil
+		return "", time.Time{}, nil
 	}
-	return string(b), err
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer f.Close()
+	// The time comes from the open file and not from its name, so that the
+	// time and the text are of the same version of the file.
+	st, err := f.Stat()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	b, err := io.ReadAll(f)
+	return string(b), st.ModTime(), err
 }
 
-// change reads the file, gives its text to f, and writes the result. It
-// writes a temporary file and renames it, so that a reader never sees half
-// a file.
+// change reads the file, gives its text to f, and writes the result when it
+// is different. It writes a temporary file and renames it, so that a reader
+// never sees half a file.
 func (s *store) change(f func(string) string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	text, err := s.read()
+	text, _, err := s.read()
 	if err != nil {
 		return err
+	}
+	out := f(text)
+	if out == text {
+		return nil
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".links-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(f(text)); err != nil {
+	if _, err := tmp.WriteString(out); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -70,42 +88,8 @@ func (s *store) change(f func(string) string) error {
 type server struct {
 	links    *store
 	password string
-}
-
-// jsonLink is one link in links.json.
-type jsonLink struct {
-	URL   string   `json:"url"`
-	Title string   `json:"title"`
-	Host  string   `json:"host"`
-	Tags  []string `json:"tags"`
-}
-
-// publicLinks gives the links that the page can show: only the links with
-// an http or https address. The newest link is first.
-func publicLinks(text string) []jsonLink {
-	out := []jsonLink{}
-	for _, l := range parse(text) {
-		if h := l.Href(); h != "" {
-			tags := l.Tags
-			if tags == nil {
-				tags = []string{}
-			}
-			out = append([]jsonLink{{h, l.Title(), l.Host(), tags}}, out...)
-		}
-	}
-	return out
-}
-
-func (s *server) linksJSON(w http.ResponseWriter, r *http.Request) {
-	text, err := s.links.read()
-	if err != nil {
-		http.Error(w, "cannot read the links", http.StatusInternalServerError)
-		log.Print(err)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "max-age=60")
-	json.NewEncoder(w).Encode(publicLinks(text))
+	// now gives the time for the date lines. Tests set a fixed time.
+	now func() time.Time
 }
 
 // admin lets only the owner through: HTTP basic auth with any user name
@@ -128,7 +112,7 @@ type adminData struct {
 }
 
 func (s *server) show(w http.ResponseWriter, message string) {
-	text, err := s.links.read()
+	text, _, err := s.links.read()
 	if err != nil {
 		http.Error(w, "cannot read the links", http.StatusInternalServerError)
 		log.Print(err)
@@ -159,7 +143,7 @@ func (s *server) add(w http.ResponseWriter, r *http.Request) {
 	}
 	var added int
 	err := s.links.change(func(text string) string {
-		text, added, _ = merge(text, []string{row})
+		text, added, _ = addDated(text, []string{row}, s.now())
 		return text
 	})
 	switch {
@@ -198,7 +182,7 @@ func (s *server) importFile(w http.ResponseWriter, r *http.Request) {
 	}
 	var added, skipped int
 	err = s.links.change(func(text string) string {
-		text, added, skipped = merge(text, importRows(string(b)))
+		text, added, skipped = addDated(text, importRows(string(b)), s.now())
 		return text
 	})
 	if err != nil {
@@ -213,7 +197,9 @@ func (s *server) importFile(w http.ResponseWriter, r *http.Request) {
 // so that nginx can send /links/ here and serve the rest of the site.
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /links/links.json", s.linksJSON)
+	mux.HandleFunc("GET /links/links.txt", s.plain)
+	mux.HandleFunc("GET /links/atom.xml", s.feed)
+	mux.HandleFunc("GET /links/list.html", s.list)
 	mux.HandleFunc("GET /links/admin", s.admin(s.adminPage))
 	mux.HandleFunc("POST /links/admin/add", s.admin(s.add))
 	mux.HandleFunc("POST /links/admin/delete", s.admin(s.delete))
@@ -235,7 +221,7 @@ func main() {
 	if pw == "" {
 		log.Fatal("set ADMIN_PASSWORD")
 	}
-	s := &server{links: &store{path: env("LINKS_FILE", "links.sbm")}, password: pw}
+	s := &server{links: &store{path: env("LINKS_FILE", "links.sbm")}, password: pw, now: time.Now}
 	addr := env("ADDR", "127.0.0.1:8082")
 	log.Printf("listening on %s, links file %s", addr, s.links.path)
 	log.Fatal(http.ListenAndServe(addr, s.routes()))

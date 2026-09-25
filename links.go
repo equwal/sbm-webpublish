@@ -6,12 +6,20 @@ package main
 //
 // The parse, import and duplicate rules are the rules of bm and sbm-sync,
 // so a file from bm works here, and the file here works in bm.
+//
+// A feed needs the time of each link, and a bm line has no time. So the
+// admin page writes a date line above the links that it adds:
+//
+//	# 2026-09-25T08:00:00Z
+//
+// bm ignores each line that starts with "#", so the file stays an sbm file.
 
 import (
 	"html"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 var (
@@ -20,10 +28,12 @@ var (
 	imported = regexp.MustCompile(`^(https?|ftp|file)://`)
 )
 
-// Link is one link of the file.
+// Link is one link of the file. Added is the time of the last date line
+// above the link, or zero when there is no date line above it.
 type Link struct {
 	URL, Desc string
 	Tags      []string
+	Added     time.Time
 }
 
 // Title gives the text of the link.
@@ -119,11 +129,30 @@ func parseLine(line string) (Link, bool) {
 	return l, l.URL != ""
 }
 
+// dateLine gives the date line of t.
+func dateLine(t time.Time) string {
+	return "# " + t.UTC().Format(time.RFC3339)
+}
+
+// dateOf gives the time of a date line, and false for all other lines.
+func dateOf(line string) (time.Time, bool) {
+	s, ok := strings.CutPrefix(line, "#")
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(s))
+	return t, err == nil
+}
+
 // parse gives the links of a file, in the order of the file.
 func parse(text string) []Link {
 	var out []Link
+	var added time.Time
 	for _, s := range lines(text) {
-		if l, ok := parseLine(s); ok {
+		if t, ok := dateOf(s); ok {
+			added = t
+		} else if l, ok := parseLine(s); ok {
+			l.Added = added
 			out = append(out, l)
 		}
 	}
@@ -242,6 +271,16 @@ func merge(text string, rows []string) (string, int, int) {
 		}
 	}
 	return join(ls), added, skipped
+}
+
+// addDated adds rows to text as merge does, below a date line of t. It
+// writes the date line only when it adds a row.
+func addDated(text string, rows []string, t time.Time) (string, int, int) {
+	out, added, skipped := merge(join(append(lines(text), dateLine(t))), rows)
+	if added == 0 {
+		return text, 0, skipped
+	}
+	return out, added, skipped
 }
 
 // remove gives text without the lines whose URL has the normal form k.
