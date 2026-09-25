@@ -80,8 +80,11 @@ import does:
 
     bm --list | ssh root@example.com 'LINKS_FILE=/var/lib/sbm-webpublish/links.sbm sbm-webpublish merge'
 
-It does not lock the file against the service, so do not use the admin
-page at the same time.
+`sbm-webpublish feed URL FEED` sets the feed of one link, as the admin
+page does. An empty FEED (`''`) removes the feed.
+
+The commands do not lock the file against the service, so do not use the
+admin page at the same time.
 
 ## Run
 

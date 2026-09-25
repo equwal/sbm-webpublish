@@ -330,6 +330,23 @@ func TestImport(t *testing.T) {
 	}
 }
 
+func TestFeedCommand(t *testing.T) {
+	s, _ := newServer(t)
+	write(t, s, "https://a.com\tA\tx\thttps://github.com/a/commits.atom\n")
+	for _, c := range []struct{ u, feed, message, file string }{
+		// A feed that the link has already changes.
+		{"a.com/", "https://a.com/Japanese.xml", "Saved the feed.", "https://a.com\tA\tx\thttps://a.com/Japanese.xml\n"},
+		{"https://b.com", "https://b.com/rss", "No link has that URL.", "https://a.com\tA\tx\thttps://a.com/Japanese.xml\n"},
+		{"https://a.com", "file:///x", "Give an http or https address for the feed.", "https://a.com\tA\tx\thttps://a.com/Japanese.xml\n"},
+	} {
+		m, err := saveFeed(s.links, c.u, c.feed)
+		b, _ := os.ReadFile(s.links.path)
+		if err != nil || m != c.message || string(b) != c.file {
+			t.Errorf("feed %s %s: %q %v, file %q", c.u, c.feed, m, err, b)
+		}
+	}
+}
+
 func TestMergeCommand(t *testing.T) {
 	s, _ := newServer(t)
 	write(t, s, "https://a.com\tA\t\n")

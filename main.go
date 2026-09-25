@@ -203,20 +203,37 @@ func (s *server) add(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// saveFeed sets the feed of the link with the URL u, and tells what it did.
+// An empty feed removes the feed.
+func saveFeed(links *store, u, feed string) (string, error) {
+	if badFeed(feed) {
+		return "Give an http or https address for the feed.", nil
+	}
+	k, found := norm(u), false
+	err := links.change(func(text string) string {
+		for _, s := range lines(text) {
+			found = found || k != "" && key(s) == k
+		}
+		return setFeed(text, k, feed)
+	})
+	switch {
+	case err != nil:
+		return "", err
+	case !found:
+		return "No link has that URL.", nil
+	}
+	return "Saved the feed.", nil
+}
+
 // editFeed sets the feed of one link. An empty feed removes the feed.
 func (s *server) editFeed(w http.ResponseWriter, r *http.Request) {
-	feed := r.FormValue("feed")
-	if badFeed(feed) {
-		done(w, r, "Give an http or https address for the feed.")
-		return
-	}
-	k := norm(r.FormValue("url"))
-	if err := s.links.change(func(text string) string { return setFeed(text, k, feed) }); err != nil {
+	message, err := saveFeed(s.links, r.FormValue("url"), r.FormValue("feed"))
+	if err != nil {
 		log.Print(err)
 		http.Error(w, "cannot write the links", http.StatusInternalServerError)
 		return
 	}
-	done(w, r, "Saved the feed.")
+	done(w, r, message)
 }
 
 func (s *server) delete(w http.ResponseWriter, r *http.Request) {
@@ -273,14 +290,22 @@ func env(name, fallback string) string {
 func main() {
 	links := &store{path: env("LINKS_FILE", "links.sbm")}
 	if len(os.Args) > 1 {
-		// "merge" adds the links of stdin, as bm --merge does. It does not
-		// lock the file against the service: do not use the admin page at
-		// the same time.
-		if os.Args[1] != "merge" || len(os.Args) > 2 {
-			fmt.Fprintln(os.Stderr, "usage: sbm-webpublish [merge < bookmarks]")
+		// The commands change the file as the admin page does, in a shell
+		// on the server. They do not lock the file against the service: do
+		// not use the admin page at the same time.
+		var message string
+		var err error
+		switch args := os.Args[1:]; {
+		case len(args) == 1 && args[0] == "merge":
+			// merge adds the links of stdin, as bm --merge does.
+			message, err = mergeFrom(links, os.Stdin, time.Now())
+		case len(args) == 3 && args[0] == "feed":
+			// feed URL FEED sets the feed of a link.
+			message, err = saveFeed(links, args[1], args[2])
+		default:
+			fmt.Fprintln(os.Stderr, "usage: sbm-webpublish [merge < bookmarks | feed URL FEED]")
 			os.Exit(2)
 		}
-		message, err := mergeFrom(links, os.Stdin, time.Now())
 		if err != nil {
 			log.Fatal(err)
 		}
