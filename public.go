@@ -20,11 +20,12 @@ import (
 )
 
 // published gives the links of text that the outputs show, in the order of
-// the file. The URL of each link is the address that Href gives.
+// the file. The URL of each link is the address that Href gives, and the
+// feed is the address that FeedHref gives.
 func published(text string) []Link {
 	var out []Link
 	for _, l := range parse(text) {
-		if l.URL = l.Href(); l.URL != "" {
+		if l.URL, l.Feed = l.Href(), l.FeedHref(); l.URL != "" {
 			out = append(out, l)
 		}
 	}
@@ -45,13 +46,14 @@ func (s *server) serve(w http.ResponseWriter, r *http.Request, contentType strin
 	http.ServeContent(w, r, "", mod, bytes.NewReader(render(published(text), mod)))
 }
 
-// plain sends the links as sbm lines, oldest first: URL, description and
-// tags, with a tab between them.
+// plain sends the links as sbm lines, oldest first: URL, description, tags
+// and feed, with a tab between them. A link without a feed has no fourth
+// field.
 func (s *server) plain(w http.ResponseWriter, r *http.Request) {
 	s.serve(w, r, "text/plain; charset=utf-8", func(ls []Link, _ time.Time) []byte {
 		var b strings.Builder
 		for _, l := range ls {
-			b.WriteString(line(l.URL, l.Desc, strings.Join(l.Tags, " ")) + "\n")
+			b.WriteString(line(l.URL, l.Desc, strings.Join(l.Tags, " "), l.Feed) + "\n")
 		}
 		return []byte(b.String())
 	})
@@ -166,13 +168,14 @@ func groups(ls []Link) []group {
 var listTmpl = template.Must(template.New("list").Parse(`{{with .}}<p>{{range .}}<a href="#{{.Tag}}">{{.Tag}}</a> {{end}}</p>
 {{range .}}<h2 id="{{.Tag}}">{{.Tag}}</h2>
 <ul>
-{{range .Links}}<li><a href="{{.URL}}">{{.Title}}</a> <small>{{.Host}}</small></li>
+{{range .Links}}<li><a href="{{.URL}}">{{.Title}}</a> <small>{{.Address}}</small>{{with .Feed}} <a class="feed" href="{{.}}">rss</a>{{end}}</li>
 {{end}}</ul>
 {{end}}{{else}}<p>No links yet.</p>
 {{end}}`))
 
-// list sends the links as an HTML fragment, under each of their tags. A page
-// of the site includes it with nginx SSI, so the page needs no script:
+// list sends the links as an HTML fragment, under each of their tags. A link
+// with a feed has an "rss" link to the feed after it. A page of the site
+// includes the fragment with nginx SSI, so the page needs no script:
 //
 //	<!--# include virtual="/links/list.html" -->
 func (s *server) list(w http.ResponseWriter, r *http.Request) {

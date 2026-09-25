@@ -1,13 +1,16 @@
 // sbm-webpublish publishes an sbm bookmark file as a list of links on a
 // web site. Everyone can get the links as sbm lines, as an Atom feed and as
 // HTML (see public.go). The owner adds, deletes and imports links on
-// /links/admin.
+// /links/admin, or adds links in a shell on the server:
+//
+//	sbm-webpublish merge < bookmarks
 package main
 
 import (
 	"crypto/subtle"
 	_ "embed"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
@@ -79,10 +82,40 @@ func (s *store) change(f func(string) string) error {
 		tmp.Close()
 		return err
 	}
+	// The links are public. With mode 0644 the service can read the file
+	// after root runs "sbm-webpublish merge" on the server.
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), s.path)
+}
+
+// importMessage tells what an import did.
+func importMessage(added, skipped, feeds int) string {
+	m := "Imported " + strconv.Itoa(added) + " links. Skipped " + strconv.Itoa(skipped) + " duplicates."
+	if feeds > 0 {
+		m += " Added " + strconv.Itoa(feeds) + " feeds to links that had none."
+	}
+	return m
+}
+
+// mergeFrom adds the links of in, as the import page does, and tells what it
+// did. in holds sbm lines or the HTML that browsers export.
+func mergeFrom(links *store, in io.Reader, now time.Time) (string, error) {
+	b, err := io.ReadAll(in)
+	if err != nil {
+		return "", err
+	}
+	var added, skipped, feeds int
+	err = links.change(func(text string) string {
+		text, added, skipped, feeds = addDated(text, importRows(string(b)), now)
+		return text
+	})
+	return importMessage(added, skipped, feeds), err
 }
 
 type server struct {
@@ -135,26 +168,55 @@ func done(w http.ResponseWriter, r *http.Request, message string) {
 	http.Redirect(w, r, "../admin?m="+template.URLQueryEscaper(message), http.StatusSeeOther)
 }
 
+// badFeed is true for a feed that the outputs cannot show: an address that
+// is not http or https.
+func badFeed(feed string) bool {
+	f := squeeze(feed)
+	return f != "" && href(f) == ""
+}
+
 func (s *server) add(w http.ResponseWriter, r *http.Request) {
-	row := line(r.FormValue("url"), r.FormValue("desc"), r.FormValue("tags"))
-	if row == "" {
+	row := line(r.FormValue("url"), r.FormValue("desc"), r.FormValue("tags"), r.FormValue("feed"))
+	switch {
+	case row == "":
 		done(w, r, "Give a URL.")
 		return
+	case badFeed(r.FormValue("feed")):
+		done(w, r, "Give an http or https address for the feed.")
+		return
 	}
-	var added int
+	var added, feeds int
 	err := s.links.change(func(text string) string {
-		text, added, _ = addDated(text, []string{row}, s.now())
+		text, added, _, feeds = addDated(text, []string{row}, s.now())
 		return text
 	})
 	switch {
 	case err != nil:
 		log.Print(err)
 		http.Error(w, "cannot write the links", http.StatusInternalServerError)
+	case feeds > 0:
+		done(w, r, "That URL is a link already. It got the feed.")
 	case added == 0:
 		done(w, r, "That URL is a link already.")
 	default:
 		done(w, r, "Added.")
 	}
+}
+
+// editFeed sets the feed of one link. An empty feed removes the feed.
+func (s *server) editFeed(w http.ResponseWriter, r *http.Request) {
+	feed := r.FormValue("feed")
+	if badFeed(feed) {
+		done(w, r, "Give an http or https address for the feed.")
+		return
+	}
+	k := norm(r.FormValue("url"))
+	if err := s.links.change(func(text string) string { return setFeed(text, k, feed) }); err != nil {
+		log.Print(err)
+		http.Error(w, "cannot write the links", http.StatusInternalServerError)
+		return
+	}
+	done(w, r, "Saved the feed.")
 }
 
 func (s *server) delete(w http.ResponseWriter, r *http.Request) {
@@ -175,22 +237,13 @@ func (s *server) importFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	b, err := io.ReadAll(f)
-	if err != nil {
-		done(w, r, "Cannot read the file.")
-		return
-	}
-	var added, skipped int
-	err = s.links.change(func(text string) string {
-		text, added, skipped = addDated(text, importRows(string(b)), s.now())
-		return text
-	})
+	message, err := mergeFrom(s.links, f, s.now())
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "cannot write the links", http.StatusInternalServerError)
 		return
 	}
-	done(w, r, "Imported "+strconv.Itoa(added)+" links. Skipped "+strconv.Itoa(skipped)+" duplicates.")
+	done(w, r, message)
 }
 
 // routes gives the handler of the server. The paths start with /links/,
@@ -203,6 +256,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /links/admin", s.admin(s.adminPage))
 	mux.HandleFunc("POST /links/admin/add", s.admin(s.add))
 	mux.HandleFunc("POST /links/admin/delete", s.admin(s.delete))
+	mux.HandleFunc("POST /links/admin/feed", s.admin(s.editFeed))
 	mux.HandleFunc("POST /links/admin/import", s.admin(s.importFile))
 	// The admin forms use basic auth, which the browser sends with each
 	// request. CrossOriginProtection refuses a POST from another site.
@@ -217,11 +271,27 @@ func env(name, fallback string) string {
 }
 
 func main() {
+	links := &store{path: env("LINKS_FILE", "links.sbm")}
+	if len(os.Args) > 1 {
+		// "merge" adds the links of stdin, as bm --merge does. It does not
+		// lock the file against the service: do not use the admin page at
+		// the same time.
+		if os.Args[1] != "merge" || len(os.Args) > 2 {
+			fmt.Fprintln(os.Stderr, "usage: sbm-webpublish [merge < bookmarks]")
+			os.Exit(2)
+		}
+		message, err := mergeFrom(links, os.Stdin, time.Now())
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(message)
+		return
+	}
 	pw := os.Getenv("ADMIN_PASSWORD")
 	if pw == "" {
 		log.Fatal("set ADMIN_PASSWORD")
 	}
-	s := &server{links: &store{path: env("LINKS_FILE", "links.sbm")}, password: pw, now: time.Now}
+	s := &server{links: links, password: pw, now: time.Now}
 	addr := env("ADDR", "127.0.0.1:8082")
 	log.Printf("listening on %s, links file %s", addr, s.links.path)
 	log.Fatal(http.ListenAndServe(addr, s.routes()))

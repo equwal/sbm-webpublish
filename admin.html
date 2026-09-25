@@ -12,6 +12,8 @@ li { margin: 0.4rem 0; }
 .host, .tags { color: #666; font-size: 0.9em; }
 .message { background: #ffd; padding: 0.5rem; }
 li form { display: inline; }
+li form.feed { display: block; margin: 0.2rem 0; }
+form.feed input[type=url] { width: 70%; }
 </style>
 </head>
 <body>
@@ -24,11 +26,12 @@ li form { display: inline; }
 <input type="url" name="url" placeholder="https://example.com" required>
 <input type="text" name="desc" placeholder="Description">
 <input type="text" name="tags" placeholder="Tags, with spaces between them">
+<input type="url" name="feed" placeholder="Feed (RSS or Atom) of the site, if it has one">
 <button>Add</button>
 </form>
 
 <h2>Import a file</h2>
-<p>An sbm bookmark file, or the HTML that a browser exports. URLs that are links already are skipped.</p>
+<p>An sbm bookmark file, or the HTML that a browser exports. URLs that are links already are skipped. A line with a feed (the fourth field) gives its feed to a link that has none.</p>
 <form method="post" action="admin/import" enctype="multipart/form-data">
 <input type="file" name="file" required>
 <button>Import</button>
@@ -37,9 +40,10 @@ li form { display: inline; }
 <h2>{{len .Links}} links, newest first</h2>
 <ul>
 {{range .Links}}<li>{{if .Href}}<a href="{{.Href}}">{{.Title}}</a>{{else}}{{.Title}}{{end}}
-<span class="host">{{.Host}}</span>
+<span class="host">{{.Address}}</span>
 {{with .Tags}}<span class="tags">{{range .}}{{.}} {{end}}</span>{{end}}
-<form method="post" action="admin/delete"><input type="hidden" name="url" value="{{.URL}}"><button>Delete</button></form></li>
+<form method="post" action="admin/delete"><input type="hidden" name="url" value="{{.URL}}"><button>Delete</button></form>
+<form class="feed" method="post" action="admin/feed"><input type="hidden" name="url" value="{{.URL}}"><input type="url" name="feed" value="{{.Feed}}" placeholder="Feed (RSS or Atom)"> <button>Save feed</button></form></li>
 {{end}}</ul>
 </body>
 </html>

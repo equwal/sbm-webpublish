@@ -8,9 +8,12 @@ It is one small Go program. At run time it needs only the Go standard
 library. The tests use rapid for property tests. The program keeps the
 links in one plain sbm file, one line for each link:
 
-    URL<tab>description<tab>tag tag tag
+    URL<tab>description<tab>tag tag tag<tab>feed
 
-so `bm`, `cut`, `awk` and `grep` can read the same file.
+so `bm`, `cut`, `awk` and `grep` can read the same file. The feed is the
+address of the RSS or Atom feed of the site. It is optional: a line without
+a feed has the three fields of `bm`. `bm` reads only the first three
+fields. `bm --merge` does not copy the feed.
 
 ## Get the links
 
@@ -19,9 +22,9 @@ contain only http and https links.
 
 | Path | Format |
 |---|---|
-| `/links/links.txt` | The links as sbm lines, oldest first. |
+| `/links/links.txt` | The links as sbm lines, oldest first. The fourth field is the feed of the site, if there is one. |
 | `/links/atom.xml` | An Atom feed, newest first. Each tag of a link is a category. |
-| `/links/list.html` | The links as an HTML fragment, under each of their tags. A page of the site includes it with nginx SSI. |
+| `/links/list.html` | The links as an HTML fragment, under each of their tags, with an "rss" link after each link that has a feed. A page of the site includes it with nginx SSI. |
 
 Each output sends `Last-Modified` and answers `If-Modified-Since` with
 `304 Not Modified`.
@@ -36,6 +39,13 @@ The plain text works with the usual tools:
     curl -s https://recentlywritten.com/links/links.txt | cut -f1
     curl -s https://recentlywritten.com/links/links.txt | bm --merge
     curl -s https://recentlywritten.com/links/links.txt | dmenu -l 20 | cut -f1 | xargs xdg-open
+
+To follow the sites of the links, make a `feed` line for sfeedrc from each
+link that has a feed. The name of each feed comes from its URL:
+
+    curl -s https://recentlywritten.com/links/links.txt | awk -F'\t' '$4 {
+        n = $1; sub(/^[a-z]+:\/\//, "", n); gsub(/[^A-Za-z0-9._-]/, "-", n)
+        printf "\tfeed '\''%s'\'' '\''%s'\''\n", n, $4 }'
 
 ## Dates
 
@@ -52,16 +62,26 @@ with an editor, write a date line above them.
 
 ## The admin page
 
-`/links/admin` lets the owner add a link, delete a link and import a file.
-It uses HTTP basic auth. Any user name works. The password is the value of
-`ADMIN_PASSWORD`. The server refuses a form POST that comes from another
-site.
+`/links/admin` lets the owner add a link with its feed, set the feed of a
+link, delete a link and import a file. It uses HTTP basic auth. Any user
+name works. The password is the value of `ADMIN_PASSWORD`. The server
+refuses a form POST that comes from another site.
 
 The import takes an sbm file or the Netscape HTML that browsers export.
 The folders of a browser bookmark become its tags. The import skips a URL
-that is a link already. Two URLs are the same link when they differ only
-in scheme, a leading `www.`, trailing slashes or the case of the host, as
-in `bm`.
+that is a link already, but a line with a feed gives its feed to a link
+that has none. Two URLs are the same link when they differ only in scheme,
+a leading `www.`, trailing slashes or the case of the host, as in `bm`.
+
+## Add links in a shell
+
+On the server, `sbm-webpublish merge` adds the links of its input, as the
+import does:
+
+    bm --list | ssh root@example.com 'LINKS_FILE=/var/lib/sbm-webpublish/links.sbm sbm-webpublish merge'
+
+It does not lock the file against the service, so do not use the admin
+page at the same time.
 
 ## Run
 
@@ -79,15 +99,17 @@ The feed has no settings. It gets its address and name from the request.
 
 ## Put it on a site
 
-1. Install the program on a server with systemd and nginx:
+1. Install the program on a server with systemd and nginx. The second
+   argument is the name of the site file in `/etc/nginx/sites-enabled`:
 
-       sh deploy/deploy.sh root@example.com
+       sh deploy/deploy.sh root@example.com example
 
    The script builds the program, installs `deploy/sbm-webpublish.service`,
    makes an admin password when there is none, and installs
    `deploy/nginx-location.conf` as `/etc/nginx/snippets/sbm-webpublish.conf`.
-2. Add `include snippets/sbm-webpublish.conf;` to the server block of the
-   site, then run `nginx -t && systemctl reload nginx`. The snippet sends
+2. The script adds `include snippets/sbm-webpublish.conf;` to each HTTPS
+   server block of the site file, runs `nginx -t` and reloads nginx. If
+   `nginx -t` fails, it puts the old site file back. The snippet sends
    `/links/` to the program and turns on SSI for `/links.html`.
 3. Put this line in the page of the links:
 

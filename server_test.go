@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -75,6 +76,7 @@ func TestAdminNeedsPassword(t *testing.T) {
 	for _, r := range []*http.Request{
 		httptest.NewRequest("GET", "/links/admin", nil),
 		form("/links/admin/add", url.Values{"url": {"https://a.com"}}),
+		form("/links/admin/feed", url.Values{"url": {"https://a.com"}, "feed": {"https://a.com/rss"}}),
 	} {
 		if w := do(h, r, false); w.Code != http.StatusUnauthorized {
 			t.Errorf("%s %s: code %d", r.Method, r.URL, w.Code)
@@ -92,7 +94,7 @@ func TestAddAndDelete(t *testing.T) {
 	if body := get(h, "/links/links.txt").Body.String(); body != "" {
 		t.Fatalf("empty store gave %q", body)
 	}
-	do(h, form("/links/admin/add", url.Values{"url": {"https://a.com"}, "desc": {"A"}, "tags": {"x y"}}), true)
+	do(h, form("/links/admin/add", url.Values{"url": {"https://a.com"}, "desc": {"A"}, "tags": {"x y"}, "feed": {"https://a.com/rss"}}), true)
 	w := do(h, form("/links/admin/add", url.Values{"url": {"b.com"}}), true)
 	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/links/admin?m=Added." {
 		t.Fatalf("add: %d %q", w.Code, w.Header().Get("Location"))
@@ -101,23 +103,57 @@ func TestAddAndDelete(t *testing.T) {
 	if !strings.Contains(w.Header().Get("Location"), "already") {
 		t.Fatalf("duplicate add: %q", w.Header().Get("Location"))
 	}
-	if body := get(h, "/links/links.txt").Body.String(); body != "https://a.com\tA\tx y\nhttps://b.com\t\t\n" {
+	if body := get(h, "/links/links.txt").Body.String(); body != "https://a.com\tA\tx y\thttps://a.com/rss\nhttps://b.com\t\t\n" {
 		t.Fatalf("links.txt: %q", body)
 	}
 	do(h, form("/links/admin/delete", url.Values{"url": {"https://b.com"}}), true)
 	// The date line of the deleted link stays. bm ignores it.
 	b, _ := os.ReadFile(s.links.path)
-	if string(b) != dayLine+"https://a.com\tA\tx y\n"+dayLine {
+	if string(b) != dayLine+"https://a.com\tA\tx y\thttps://a.com/rss\n"+dayLine {
 		t.Fatalf("file: %q", b)
+	}
+}
+
+func location(w *httptest.ResponseRecorder) string {
+	m, _ := url.ParseQuery(strings.TrimPrefix(w.Header().Get("Location"), "/links/admin?"))
+	return m.Get("m")
+}
+
+func TestAddGivesTheFeedToALinkWithout(t *testing.T) {
+	s, h := newServer(t)
+	do(h, form("/links/admin/add", url.Values{"url": {"https://a.com"}, "desc": {"A"}}), true)
+	w := do(h, form("/links/admin/add", url.Values{"url": {"a.com/"}, "desc": {"other"}, "feed": {"https://a.com/rss"}}), true)
+	if m := location(w); m != "That URL is a link already. It got the feed." {
+		t.Fatalf("message %q", m)
+	}
+	// One date line only: no link was added the second time.
+	if b, _ := os.ReadFile(s.links.path); string(b) != dayLine+"https://a.com\tA\t\thttps://a.com/rss\n" {
+		t.Fatalf("file: %q", b)
+	}
+}
+
+func TestEditFeed(t *testing.T) {
+	s, h := newServer(t)
+	write(t, s, dayLine+"https://a.com\tA\tx\nhttps://b.com\tB\t\n")
+	for _, c := range []struct{ feed, message, file string }{
+		{"https://a.com/rss", "Saved the feed.", dayLine + "https://a.com\tA\tx\thttps://a.com/rss\nhttps://b.com\tB\t\n"},
+		{"javascript:alert(1)", "Give an http or https address for the feed.", dayLine + "https://a.com\tA\tx\thttps://a.com/rss\nhttps://b.com\tB\t\n"},
+		{"", "Saved the feed.", dayLine + "https://a.com\tA\tx\nhttps://b.com\tB\t\n"},
+	} {
+		w := do(h, form("/links/admin/feed", url.Values{"url": {"https://a.com"}, "feed": {c.feed}}), true)
+		b, _ := os.ReadFile(s.links.path)
+		if m := location(w); m != c.message || string(b) != c.file {
+			t.Errorf("feed %q: message %q, file %q", c.feed, m, b)
+		}
 	}
 }
 
 func TestOutputsHideUnsafeLinks(t *testing.T) {
 	s, h := newServer(t)
-	write(t, s, "javascript:alert(1)\tx\t\ndata:text/html,x\ty\t\nhttps://a.com\tA\t\n")
+	write(t, s, "javascript:alert(1)\tx\t\ndata:text/html,x\ty\t\nhttps://a.com\tA\t\nhttps://b.com\tB\t\tjavascript:alert(2)\n")
 	for _, path := range []string{"/links/links.txt", "/links/atom.xml", "/links/list.html"} {
 		body := get(h, path).Body.String()
-		if strings.Contains(body, "javascript") || strings.Contains(body, "data:") || !strings.Contains(body, "https://a.com") {
+		if strings.Contains(body, "javascript") || strings.Contains(body, "data:") || !strings.Contains(body, "https://a.com") || !strings.Contains(body, "https://b.com") {
 			t.Errorf("%s: %s", path, body)
 		}
 	}
@@ -165,7 +201,8 @@ func genPublicRow(t *rapid.T) string {
 	path := rapid.StringMatching(`[a-z]{0,3}`).Draw(t, "path")
 	desc := rapid.StringMatching(`[a-z<>&"' \]\t]{0,10}`).Draw(t, "desc")
 	tags := rapid.StringMatching(`[a-z<>&" ]{0,8}`).Draw(t, "tags")
-	return line(u+path, desc, tags)
+	feed := rapid.SampledFrom([]string{"", "https://a.com/feed", "http://b.org/rss?x=<1>&y", "c.net/atom.xml", "javascript:alert(2)"}).Draw(t, "feed")
+	return line(u+path, desc, tags, feed)
 }
 
 // TestOutputsRoundTrip: links.txt parses back to the published links, and the
@@ -177,7 +214,7 @@ func TestOutputsRoundTrip(t *testing.T) {
 		for range rapid.IntRange(0, 3).Draw(t, "batches") {
 			rows := rapid.SliceOf(rapid.Custom(genPublicRow)).Draw(t, "rows")
 			when := time.Unix(rapid.Int64Range(0, 4102444800).Draw(t, "when"), 0)
-			text, _, _ = addDated(text, rows, when)
+			text, _, _, _ = addDated(text, rows, when)
 		}
 		write(t, s, text)
 		want := published(text)
@@ -187,7 +224,7 @@ func TestOutputsRoundTrip(t *testing.T) {
 			t.Fatalf("links.txt has %d links, want %d", len(got), len(want))
 		}
 		for i := range want {
-			if got[i].URL != want[i].URL || got[i].Desc != want[i].Desc || !slices.Equal(got[i].Tags, want[i].Tags) {
+			if got[i].URL != want[i].URL || got[i].Desc != want[i].Desc || !slices.Equal(got[i].Tags, want[i].Tags) || got[i].Feed != want[i].Feed {
 				t.Fatalf("links.txt link %d is %+v, want %+v", i, got[i], want[i])
 			}
 		}
@@ -235,16 +272,16 @@ func TestList(t *testing.T) {
 	if body := get(h, "/links/list.html").Body.String(); body != "<p>No links yet.</p>\n" {
 		t.Fatalf("empty list: %q", body)
 	}
-	write(t, s, "https://a.com\t<A>\tx y\nhttps://b.com\tB\t\nhttps://c.com\tC\ty y\n")
+	write(t, s, "https://a.com/x/\t<A>\tx y\thttps://a.com/rss\nhttps://b.com\tB\t\nhttps://c.com\tC\ty y\n")
 	want := `<p><a href="#x">x</a> <a href="#y">y</a> <a href="#untagged">untagged</a> </p>
 <h2 id="x">x</h2>
 <ul>
-<li><a href="https://a.com">&lt;A&gt;</a> <small>a.com</small></li>
+<li><a href="https://a.com/x/">&lt;A&gt;</a> <small>a.com/x</small> <a class="feed" href="https://a.com/rss">rss</a></li>
 </ul>
 <h2 id="y">y</h2>
 <ul>
 <li><a href="https://c.com">C</a> <small>c.com</small></li>
-<li><a href="https://a.com">&lt;A&gt;</a> <small>a.com</small></li>
+<li><a href="https://a.com/x/">&lt;A&gt;</a> <small>a.com/x</small> <a class="feed" href="https://a.com/rss">rss</a></li>
 </ul>
 <h2 id="untagged">untagged</h2>
 <ul>
@@ -262,17 +299,35 @@ func TestImport(t *testing.T) {
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
 	f, _ := mw.CreateFormFile("file", "bookmarks.sbm")
-	f.Write([]byte("https://a.com/\tagain\t\nhttps://b.com\tB\tt\n"))
+	f.Write([]byte("https://a.com/\tagain\t\thttps://a.com/rss\nhttps://b.com\tB\tt\n"))
 	mw.Close()
 	r := httptest.NewRequest("POST", "/links/admin/import", &body)
 	r.Header.Set("Content-Type", mw.FormDataContentType())
 	w := do(h, r, true)
-	if loc := w.Header().Get("Location"); !strings.Contains(loc, "Imported+1+links.+Skipped+1") {
-		t.Fatalf("import: %d %q", w.Code, loc)
+	if m := location(w); m != "Imported 1 links. Skipped 1 duplicates. Added 1 feeds to links that had none." {
+		t.Fatalf("import: %d %q", w.Code, m)
+	}
+	// The link a.com keeps its description, and gets the feed.
+	b, _ := os.ReadFile(s.links.path)
+	if string(b) != "https://a.com\tA\t\thttps://a.com/rss\n"+dayLine+"https://b.com\tB\tt\n" {
+		t.Fatalf("file: %q", b)
+	}
+}
+
+func TestMergeCommand(t *testing.T) {
+	s, _ := newServer(t)
+	write(t, s, "https://a.com\tA\t\n")
+	m, err := mergeFrom(s.links, strings.NewReader("https://b.com\tB\tt\thttps://b.com/rss\nhttps://a.com\tagain\t\n"), day)
+	if err != nil || m != "Imported 1 links. Skipped 1 duplicates." {
+		t.Fatalf("%q %v", m, err)
 	}
 	b, _ := os.ReadFile(s.links.path)
-	if string(b) != "https://a.com\tA\t\n"+dayLine+"https://b.com\tB\tt\n" {
+	if string(b) != "https://a.com\tA\t\n"+dayLine+"https://b.com\tB\tt\thttps://b.com/rss\n" {
 		t.Fatalf("file: %q", b)
+	}
+	// The service must be able to read a file that root wrote.
+	if st, err := os.Stat(s.links.path); runtime.GOOS != "windows" && (err != nil || st.Mode().Perm() != 0o644) {
+		t.Fatalf("mode %v %v", st.Mode(), err)
 	}
 }
 

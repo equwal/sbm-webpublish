@@ -9,15 +9,27 @@ import (
 	"pgregory.net/rapid"
 )
 
-// genRow makes a file line: a URL, a description and tags, with tabs,
-// spaces and line breaks in awkward places.
+// genRow makes a file line: a URL, a description, tags and sometimes a feed,
+// with tabs, spaces and line breaks in awkward places.
 func genRow(t *rapid.T) string {
 	host := rapid.SampledFrom([]string{"a.com", "www.a.com", "b.org", "c.net"}).Draw(t, "host")
 	path := rapid.SampledFrom([]string{"", "/", "/x", "/x/", "/y"}).Draw(t, "path")
 	sch := rapid.SampledFrom([]string{"https://", "http://", ""}).Draw(t, "scheme")
 	desc := rapid.StringMatching(`[a-z \t\n]{0,8}`).Draw(t, "desc")
 	tags := rapid.StringMatching(`[a-z ]{0,8}`).Draw(t, "tags")
-	return line(sch+host+path, desc, tags)
+	feed := rapid.SampledFrom([]string{"", "", "https://a.com/feed", "b.org/rss", " c.net/atom.xml "}).Draw(t, "feed")
+	return line(sch+host+path, desc, tags, feed)
+}
+
+// countDates gives the number of date lines of text.
+func countDates(text string) int {
+	n := 0
+	for _, s := range lines(text) {
+		if _, ok := dateOf(s); ok {
+			n++
+		}
+	}
+	return n
 }
 
 func TestLineParsesBack(t *testing.T) {
@@ -25,15 +37,21 @@ func TestLineParsesBack(t *testing.T) {
 		u := rapid.StringMatching(`[a-z:/. ]{1,12}`).Draw(t, "url")
 		desc := rapid.String().Draw(t, "desc")
 		tags := rapid.StringMatching(`[a-z \t]{0,12}`).Draw(t, "tags")
-		row := line(u, desc, tags)
+		feed := rapid.StringMatching(`[a-z:/. \t]{0,12}`).Draw(t, "feed")
+		row := line(u, desc, tags, feed)
 		if row == "" {
 			return
 		}
-		if strings.ContainsAny(row, "\n\r") || strings.Count(row, "\t") != 2 {
+		// A line without a feed has the three fields of bm.
+		tabs := 2
+		if squeeze(feed) != "" {
+			tabs = 3
+		}
+		if strings.ContainsAny(row, "\n\r") || strings.Count(row, "\t") != tabs {
 			t.Fatalf("bad line %q", row)
 		}
 		l, ok := parseLine(row)
-		if !ok || l.URL != strings.Join(strings.Fields(u), "") || !slices.Equal(l.Tags, strings.Fields(tags)) {
+		if !ok || l.URL != squeeze(u) || !slices.Equal(l.Tags, strings.Fields(tags)) || l.Feed != squeeze(feed) {
 			t.Fatalf("line %q parsed as %+v", row, l)
 		}
 	})
@@ -41,9 +59,9 @@ func TestLineParsesBack(t *testing.T) {
 
 func TestMergeKeepsOneLineForEachURL(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		base, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "base"))
+		base, _, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "base"))
 		rows := rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "rows")
-		text, added, skipped := merge(base, rows)
+		text, added, skipped, _ := merge(base, rows)
 		if added+skipped != len(rows) {
 			t.Fatalf("added %d + skipped %d != %d rows", added, skipped, len(rows))
 		}
@@ -59,15 +77,70 @@ func TestMergeKeepsOneLineForEachURL(t *testing.T) {
 				t.Fatalf("row %q is missing", r)
 			}
 		}
-		if again, n, _ := merge(text, rows); n != 0 || again != text {
+		if again, n, _, f := merge(text, rows); n != 0 || f != 0 || again != text {
 			t.Fatalf("second merge changed the file")
+		}
+	})
+}
+
+// TestMergeFeeds: after merge, each link has the first feed of its URL: the
+// feed of its line in the text, else the feed of the first row with that
+// URL that has a feed.
+func TestMergeFeeds(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		base, _, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "base"))
+		rows := rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "rows")
+		out, _, _, feeds := merge(base, rows)
+		want, seen, filled := map[string]string{}, map[string]bool{}, 0
+		for _, s := range append(lines(base), rows...) {
+			k := key(s)
+			l, _ := parseLine(s)
+			switch {
+			case k == "":
+			case !seen[k]:
+				seen[k], want[k] = true, l.Feed
+			case want[k] == "" && l.Feed != "":
+				want[k] = l.Feed
+				filled++
+			}
+		}
+		if feeds != filled {
+			t.Fatalf("merge gave %d feeds, want %d", feeds, filled)
+		}
+		for _, s := range lines(out) {
+			if l, _ := parseLine(s); l.Feed != want[key(s)] {
+				t.Fatalf("%q has the feed %q, want %q", s, l.Feed, want[key(s)])
+			}
+		}
+	})
+}
+
+func TestSetFeed(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		text, _, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "rows"))
+		k := key(genRow(t))
+		feed := rapid.SampledFrom([]string{"", "https://x.org/feed", " y.org/rss "}).Draw(t, "feed")
+		old, ls := lines(text), lines(setFeed(text, k, feed))
+		if len(ls) != len(old) {
+			t.Fatalf("%d lines, want %d", len(ls), len(old))
+		}
+		for i := range old {
+			a, _ := parseLine(old[i])
+			b, _ := parseLine(ls[i])
+			want := a.Feed
+			if key(old[i]) == k {
+				want = squeeze(feed)
+			}
+			if b.URL != a.URL || b.Desc != a.Desc || !slices.Equal(b.Tags, a.Tags) || b.Feed != want {
+				t.Fatalf("line %q became %q, want the feed %q", old[i], ls[i], want)
+			}
 		}
 	})
 }
 
 func TestRemove(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		text, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "rows"))
+		text, _, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "rows"))
 		k := key(genRow(t))
 		out := remove(text, k)
 		var want []string
@@ -111,21 +184,25 @@ func TestParseDates(t *testing.T) {
 
 func TestAddDatedDatesOnlyTheNewLinks(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		base, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "base"))
+		base, _, _, _ := merge("", rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "base"))
 		rows := rapid.SliceOf(rapid.Custom(genRow)).Draw(t, "rows")
 		when := time.Unix(rapid.Int64Range(0, 4102444800).Draw(t, "when"), 0)
-		out, added, _ := addDated(base, rows, when)
+		out, added, _, feeds := addDated(base, rows, when)
 		old, ls := parse(base), parse(out)
+		dates := countDates(base)
+		if added > 0 {
+			dates++
+		}
 		switch {
-		case added == 0 && out != base:
-			t.Fatalf("no link added, but the text changed to %q", out)
-		case added > 0 && !strings.HasPrefix(out, base+dateLine(when)+"\n"):
-			t.Fatalf("no date line after the old links in %q", out)
+		case added == 0 && feeds == 0 && out != base:
+			t.Fatalf("no link and no feed added, but the text changed to %q", out)
+		case countDates(out) != dates:
+			t.Fatalf("%d date lines in %q, want %d", countDates(out), out, dates)
 		case len(ls) != len(old)+added:
 			t.Fatalf("%d links, want %d + %d", len(ls), len(old), added)
 		}
 		for i, l := range ls {
-			if i < len(old) && !l.Added.Equal(old[i].Added) || i >= len(old) && !l.Added.Equal(when) {
+			if i < len(old) && (l.URL != old[i].URL || !l.Added.Equal(old[i].Added)) || i >= len(old) && !l.Added.Equal(when) {
 				t.Fatalf("link %d %q has the time %v", i, l.URL, l.Added)
 			}
 		}
@@ -137,6 +214,7 @@ func TestHrefIsOnlyHTTP(t *testing.T) {
 		"https://a.com":         "https://a.com",
 		"HTTP://a.com":          "HTTP://a.com",
 		"a.com/x":               "https://a.com/x",
+		"":                      "",
 		"javascript:alert(1)":   "",
 		"data:text/html,x":      "",
 		"ftp://a.com":           "",
@@ -144,6 +222,21 @@ func TestHrefIsOnlyHTTP(t *testing.T) {
 	} {
 		if got := (Link{URL: u}).Href(); got != want {
 			t.Errorf("Href(%q) = %q, want %q", u, got, want)
+		}
+		if got := (Link{Feed: u}).FeedHref(); got != want {
+			t.Errorf("FeedHref(%q) = %q, want %q", u, got, want)
+		}
+	}
+}
+
+func TestAddress(t *testing.T) {
+	for u, want := range map[string]string{
+		"https://github.com/equwal/sbm/": "github.com/equwal/sbm",
+		"http://a.com":                   "a.com",
+		"a.com/x?y=1":                    "a.com/x?y=1",
+	} {
+		if got := (Link{URL: u}).Address(); got != want {
+			t.Errorf("Address(%q) = %q, want %q", u, got, want)
 		}
 	}
 }
@@ -165,7 +258,7 @@ func TestFromHTML(t *testing.T) {
 }
 
 func TestMergeOldFormat(t *testing.T) {
-	text, added, _ := merge("", []string{"https://a.com some site"})
+	text, added, _, _ := merge("", []string{"https://a.com some site"})
 	if added != 1 || text != "https://a.com\tsome site\t\n" {
 		t.Fatalf("got %q", text)
 	}
