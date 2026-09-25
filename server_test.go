@@ -132,6 +132,22 @@ func TestAddGivesTheFeedToALinkWithout(t *testing.T) {
 	}
 }
 
+func TestAdminPageShowsFeeds(t *testing.T) {
+	s, h := newServer(t)
+	write(t, s, "https://github.com/a/b\tB\tx\thttps://github.com/a/b/releases.atom\nhttps://c.com\tC\t\n")
+	body := do(h, httptest.NewRequest("GET", "/links/admin", nil), true).Body.String()
+	for _, want := range []string{
+		`<input type="url" name="feed" placeholder="Feed (RSS or Atom) of the site, if it has one">`,
+		`<span class="host">github.com/a/b</span>`,
+		`<input type="url" name="feed" value="https://github.com/a/b/releases.atom" placeholder="Feed (RSS or Atom)">`,
+		`<input type="url" name="feed" value="" placeholder="Feed (RSS or Atom)">`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("admin page has no %s", want)
+		}
+	}
+}
+
 func TestEditFeed(t *testing.T) {
 	s, h := newServer(t)
 	write(t, s, dayLine+"https://a.com\tA\tx\nhttps://b.com\tB\t\n")
