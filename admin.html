@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Links admin</title>
+<style>
+body { font-family: sans-serif; max-width: 48rem; margin: 1rem auto; padding: 0 1rem; }
+form { margin: 0.5rem 0; }
+input[type=text], input[type=url] { width: 100%; box-sizing: border-box; margin: 0.2rem 0; }
+li { margin: 0.4rem 0; }
+.host, .tags { color: #666; font-size: 0.9em; }
+.message { background: #ffd; padding: 0.5rem; }
+li form { display: inline; }
+</style>
+</head>
+<body>
+<h1>Links</h1>
+<p><a href="links.json">links.json</a> · <a href="/links.html">public page</a></p>
+{{with .Message}}<p class="message">{{.}}</p>{{end}}
+
+<h2>Add a link</h2>
+<form method="post" action="admin/add">
+<input type="url" name="url" placeholder="https://example.com" required>
+<input type="text" name="desc" placeholder="Description">
+<input type="text" name="tags" placeholder="Tags, with spaces between them">
+<button>Add</button>
+</form>
+
+<h2>Import a file</h2>
+<p>An sbm bookmark file, or the HTML that a browser exports. URLs that are links already are skipped.</p>
+<form method="post" action="admin/import" enctype="multipart/form-data">
+<input type="file" name="file" required>
+<button>Import</button>
+</form>
+
+<h2>{{len .Links}} links, newest first</h2>
+<ul>
+{{range .Links}}<li>{{if .Href}}<a href="{{.Href}}">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+<span class="host">{{.Host}}</span>
+{{with .Tags}}<span class="tags">{{range .}}{{.}} {{end}}</span>{{end}}
+<form method="post" action="admin/delete"><input type="hidden" name="url" value="{{.URL}}"><button>Delete</button></form></li>
+{{end}}</ul>
+</body>
+</html>

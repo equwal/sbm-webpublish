@@ -1,0 +1,25 @@
+# systemd unit for sbm-webpublish.
+# Install:
+#   GOOS=linux GOARCH=amd64 go build -o sbm-webpublish .
+#   copy the binary to /usr/local/bin/sbm-webpublish
+#   put ADMIN_PASSWORD=... in /etc/sbm-webpublish.env (mode 600)
+#   copy this file to /etc/systemd/system/sbm-webpublish.service
+#   systemctl daemon-reload && systemctl enable --now sbm-webpublish
+[Unit]
+Description=sbm-webpublish: links from an sbm bookmark file
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/sbm-webpublish.env
+Environment=LINKS_FILE=/var/lib/sbm-webpublish/links.sbm
+ExecStart=/usr/local/bin/sbm-webpublish
+DynamicUser=yes
+StateDirectory=sbm-webpublish
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
